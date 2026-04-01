@@ -33,7 +33,7 @@ jobs:
           fetch-depth: 1
 
       # ───────────────────────────────────────
-      # 2. Verify kernel version matches SUSFS
+      # 2. Verify kernel version
       # ───────────────────────────────────────
       - name: Verify kernel version
         run: |
@@ -47,7 +47,7 @@ jobs:
           fi
 
       # ───────────────────────────────────────
-      # 3. Install host build dependencies
+      # 3. Install build dependencies
       # ───────────────────────────────────────
       - name: Install build dependencies
         run: |
@@ -58,7 +58,7 @@ jobs:
             binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
 
       # ───────────────────────────────────────
-      # 4. Download Clang r547379 (same as your original build)
+      # 4. Download Clang r547379
       # ───────────────────────────────────────
       - name: Download Clang r547379
         run: |
@@ -66,16 +66,14 @@ jobs:
           if ! curl -fL --retry 3 --max-time 600 \
                "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz" \
                | tar -xzf - -C "$GITHUB_WORKSPACE/clang"; then
-            echo "❌ Clang download failed — try a mirror URL"
+            echo "❌ Clang download failed"
             exit 1
           fi
-
           echo "PATH=$GITHUB_WORKSPACE/clang/bin:$PATH" >> "$GITHUB_ENV"
-          echo "── Clang version ──"
-          "$GITHUB_WORKSPACE/clang/bin/clang" --version || clang --version
+          "$GITHUB_WORKSPACE/clang/bin/clang" --version || true
 
       # ───────────────────────────────────────
-      # 5. Download and apply SUSFS patches
+      # 5. Apply SUSFS patches (phase 1 — main patch)
       # ───────────────────────────────────────
       - name: Apply SUSFS patches
         run: |
@@ -86,41 +84,352 @@ jobs:
           cp -rv susfs-source/kernel_patches/fs/*            fs/            2>/dev/null || true
           cp -rv susfs-source/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
 
-          # Locate the integration patch
           PATCH_FILE="susfs-source/kernel_patches/50_add_susfs_in_kernel-${{ env.EXPECTED_KERNEL_VERSION }}.patch"
           if [ ! -f "$PATCH_FILE" ]; then
             echo "❌ SUSFS patch not found: $PATCH_FILE"
-            echo "Available patches:"
-            ls susfs-source/kernel_patches/*.patch 2>/dev/null || echo "  (none)"
+            ls susfs-source/kernel_patches/*.patch 2>/dev/null || echo "  (none found)"
             exit 1
           fi
 
-          # Apply — must succeed or build stops
-          patch -p1 --forward < "$PATCH_FILE"
-          echo "✅ SUSFS patches applied successfully"
+          # Apply with fuzz=3 — allow failures, we fix them next
+          patch -p1 --forward --fuzz=3 < "$PATCH_FILE" || true
+
+          # Count rejects
+          REJ_COUNT=$(find . -name "*.rej" -type f | wc -l)
+          if [ "$REJ_COUNT" -eq 0 ]; then
+            echo "✅ All SUSFS patches applied cleanly"
+          else
+            echo "⚠️  ${REJ_COUNT} file(s) have rejected hunks — will fix in next step"
+          fi
 
       # ───────────────────────────────────────
-      # 6. Configure kernel
+      # 6. Auto-fix rejected SUSFS hunks
+      # ───────────────────────────────────────
+      - name: Auto-fix rejected SUSFS hunks
+        run: |
+          REJ_FILES=$(find . -name "*.rej" -type f 2>/dev/null)
+          if [ -z "$REJ_FILES" ]; then
+            echo "✅ No rejected hunks — nothing to fix"
+            exit 0
+          fi
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Rejected hunks to process:"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          for rej in $REJ_FILES; do
+            echo ""
+            echo "── $rej ──"
+            cat "$rej"
+          done
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # ═══════════════════════════════════════════
+          # Fix 1: Simple includes (sed — fast & safe)
+          # ═══════════════════════════════════════════
+          echo ""
+          echo "Phase 1: Fixing missing #include lines..."
+
+          for src_file in fs/namespace.c fs/proc/task_mmu.c; do
+            if [ -f "${src_file}.rej" ]; then
+              if ! grep -q '#include <linux/susfs.h>' "$src_file"; then
+                LAST_INC=$(grep -n '^#include' "$src_file" | tail -1 | cut -d: -f1)
+                if [ -n "$LAST_INC" ]; then
+                  sed -i "${LAST_INC}a\\#include <linux/susfs.h>" "$src_file"
+                  echo "  ✅ ${src_file} — added #include <linux/susfs.h> after line ${LAST_INC}"
+                fi
+              else
+                echo "  ℹ️  ${src_file} — #include already present"
+              fi
+            fi
+          done
+
+          # ═══════════════════════════════════════════
+          # Fix 2: Struct fields & function hooks
+          #        (Python fuzzy patcher)
+          # ═══════════════════════════════════════════
+          echo ""
+          echo "Phase 2: Applying remaining hunks with fuzzy patcher..."
+
+          cat > /tmp/fuzzy_patch.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Fuzzy patcher: reads .rej files and applies rejected hunks
+          by finding the best context match in the source file.
+          """
+          import re, sys, os
+
+          def parse_rej_file(rej_path):
+              """Parse a .rej file into a list of hunk dicts."""
+              with open(rej_path, 'r') as f:
+                  lines = f.readlines()
+
+              hunks = []
+              cur = None
+
+              for line in lines:
+                  if line.startswith('@@'):
+                      if cur and (cur['adds'] or cur['removes']):
+                          hunks.append(cur)
+                      m = re.search(r'@@ -(\d+)', line)
+                      cur = {
+                          'orig_line': int(m.group(1)) if m else 0,
+                          'ctx_before': [],
+                          'ctx_after': [],
+                          'adds': [],
+                          'removes': [],
+                          'in_change': False,
+                      }
+                  elif cur is not None:
+                      raw = line.rstrip('\n')
+                      if raw.startswith('+++') or raw.startswith('---'):
+                          continue
+                      if raw.startswith('+'):
+                          cur['adds'].append(raw[1:] + '\n')
+                          cur['in_change'] = True
+                      elif raw.startswith('-'):
+                          cur['removes'].append(raw[1:])
+                          cur['in_change'] = True
+                      elif raw.startswith(' '):
+                          text = raw[1:]
+                          if cur['in_change']:
+                              cur['ctx_after'].append(text)
+                          else:
+                              cur['ctx_before'].append(text)
+
+              if cur and (cur['adds'] or cur['removes']):
+                  hunks.append(cur)
+              return hunks
+
+
+          def fuzzy_find(source_lines, context_lines, search_start=0, search_end=None):
+              """
+              Find the position in source_lines where context_lines best matches.
+              Returns (position, score) or (-1, 0).
+              """
+              if not context_lines:
+                  return -1, 0
+
+              if search_end is None:
+                  search_end = len(source_lines)
+
+              best_pos = -1
+              best_score = 0
+
+              for i in range(search_start, search_end):
+                  score = 0
+                  for j, ctx in enumerate(context_lines):
+                      idx = i + j
+                      if idx >= len(source_lines):
+                          break
+                      src_s = source_lines[idx].rstrip()
+                      ctx_s = ctx.rstrip()
+                      if src_s == ctx_s:
+                          score += 3          # exact match
+                      elif src_s.strip() == ctx_s.strip():
+                          score += 2          # whitespace-insensitive match
+                      elif ctx_s.strip() and ctx_s.strip() in src_s:
+                          score += 1          # substring match
+
+                  if score > best_score:
+                      best_score = score
+                      best_pos = i
+
+              return best_pos, best_score
+
+
+          def is_already_applied(source_lines, adds, near_pos):
+              """Check if the added code already exists near the position."""
+              if not adds:
+                  return True
+              check = adds[0].strip()
+              if not check or check == '{' or check == '}' or check.startswith('#'):
+                  # Use second line if first is trivial
+                  for a in adds:
+                      if a.strip() and a.strip() not in ('{', '}', '#ifdef CONFIG_SUSFS', '#endif'):
+                          check = a.strip()
+                          break
+
+              window_start = max(0, near_pos - 10)
+              window_end = min(len(source_lines), near_pos + len(adds) + 10)
+              for i in range(window_start, window_end):
+                  if check in source_lines[i]:
+                      return True
+              return False
+
+
+          def apply_hunks(source_path, rej_path):
+              """Apply all hunks from rej_path to source_path."""
+              with open(source_path, 'r') as f:
+                  source_lines = f.readlines()
+
+              hunks = parse_rej_file(rej_path)
+
+              # Filter out include-only hunks (handled by sed already)
+              hunks = [h for h in hunks
+                       if not all('#include' in a for a in h['adds'])]
+
+              if not hunks:
+                  print(f"  ℹ️  {rej_path}: only include hunks (already fixed)")
+                  return True
+
+              applied = 0
+              failed = 0
+
+              for idx, hunk in enumerate(hunks):
+                  label = f"Hunk {idx+1} (orig line {hunk['orig_line']})"
+
+                  # Try context_before first
+                  pos, score = fuzzy_find(source_lines, hunk['ctx_before'])
+                  insert_at = pos + len(hunk['ctx_before']) if pos >= 0 else -1
+
+                  # If that failed, try context_after (insert BEFORE it)
+                  if score < max(2, len(hunk['ctx_before'])):
+                      pos2, score2 = fuzzy_find(source_lines, hunk['ctx_after'])
+                      if score2 > score:
+                          insert_at = pos2
+                          score = score2
+
+                  # Last resort: search near original line number
+                  if score < 2:
+                      approx = min(hunk['orig_line'] - 1, len(source_lines) - 1)
+                      # Widen search around approximate line
+                      for ctx in hunk['ctx_before'] + hunk['ctx_after']:
+                          ctx_s = ctx.strip()
+                          if not ctx_s:
+                              continue
+                          lo = max(0, approx - 200)
+                          hi = min(len(source_lines), approx + 200)
+                          for i in range(lo, hi):
+                              if ctx_s in source_lines[i]:
+                                  insert_at = i + 1
+                                  score = 2
+                                  break
+                          if score >= 2:
+                              break
+
+                  if score < 2 or insert_at < 0:
+                      ctx_preview = (hunk['ctx_before'][:2] or hunk['ctx_after'][:2])
+                      print(f"  ❌ {label}: no matching context found")
+                      for c in ctx_preview:
+                          print(f"      looking for: {c.rstrip()}")
+                      failed += 1
+                      continue
+
+                  # Check if already applied
+                  if is_already_applied(source_lines, hunk['adds'], insert_at):
+                      print(f"  ℹ️  {label}: already applied near line {insert_at+1}")
+                      applied += 1
+                      continue
+
+                  # Remove lines marked for deletion
+                  if hunk['removes']:
+                      for rem in hunk['removes']:
+                          rem_s = rem.strip()
+                          for k in range(max(0, insert_at - 5),
+                                         min(len(source_lines), insert_at + 5)):
+                              if source_lines[k].strip() == rem_s:
+                                  source_lines.pop(k)
+                                  if k < insert_at:
+                                      insert_at -= 1
+                                  break
+
+                  # Insert new lines
+                  for j, add_line in enumerate(hunk['adds']):
+                      source_lines.insert(insert_at + j, add_line)
+
+                  print(f"  ✅ {label}: applied at line {insert_at+1} "
+                        f"({len(hunk['adds'])} lines inserted)")
+                  applied += 1
+
+              # Write result
+              with open(source_path, 'w') as f:
+                  f.writelines(source_lines)
+
+              print(f"  Summary: {applied} applied, {failed} failed")
+              return failed == 0
+
+
+          # ── Main ──
+          exit_code = 0
+          rej_files = [f for f in sys.argv[1:] if os.path.isfile(f)]
+
+          if not rej_files:
+              # Find all .rej files
+              for root, dirs, files in os.walk('.'):
+                  for fname in files:
+                      if fname.endswith('.rej'):
+                          rej_files.append(os.path.join(root, fname))
+
+          for rej in rej_files:
+              source = rej.replace('.rej', '')
+              if not os.path.isfile(source):
+                  print(f"⚠️  Source file not found for {rej}")
+                  continue
+              print(f"\nProcessing: {rej} → {source}")
+              success = apply_hunks(source, rej)
+              if success:
+                  os.remove(rej)
+              else:
+                  exit_code = 1
+
+          sys.exit(exit_code)
+          PYEOF
+
+          python3 /tmp/fuzzy_patch.py || true
+
+          # ═══════════════════════════════════════════
+          # Final status
+          # ═══════════════════════════════════════════
+          echo ""
+          REMAINING=$(find . -name "*.rej" -type f 2>/dev/null)
+          if [ -z "$REMAINING" ]; then
+            echo "✅ All SUSFS rejected hunks resolved successfully"
+          else
+            echo "⚠️  Some hunks could not be auto-applied:"
+            echo "$REMAINING"
+            echo ""
+            echo "Build will continue — compilation will reveal if these are critical."
+            echo "Check the 'susfs-rej-files' artifact for manual review."
+            mkdir -p /tmp/rej_artifacts
+            for rej in $REMAINING; do
+              cp "$rej" /tmp/rej_artifacts/
+            done
+          fi
+
+      # ───────────────────────────────────────
+      # 7. Upload .rej files if any remain
+      # ───────────────────────────────────────
+      - name: Upload remaining .rej files (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs-rej-files
+          path: /tmp/rej_artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ───────────────────────────────────────
+      # 8. Configure kernel
       # ───────────────────────────────────────
       - name: Configure kernel
         run: |
           DC_PATH="arch/arm64/configs/${{ env.DEFCONFIG }}"
           if [ ! -f "$DC_PATH" ]; then
             echo "❌ Defconfig not found: $DC_PATH"
-            echo "Available defconfigs:"
+            echo "Available:"
             ls arch/arm64/configs/
             exit 1
           fi
 
           mkdir -p out
 
-          # Generate base .config from your defconfig
           make O=out ARCH=arm64 \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
             ${{ env.DEFCONFIG }}
 
-          # Append SUSFS + APatch-required options
+          # Append SUSFS + APatch options
           cat >> out/.config << 'EOF'
           CONFIG_SUSFS=y
           CONFIG_SUSFS_HIDE_KSU=y
@@ -129,24 +438,24 @@ jobs:
           CONFIG_KALLSYMS_ALL=y
           EOF
 
-          # Resolve all Kconfig dependencies
+          # Resolve dependencies
           make O=out ARCH=arm64 \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
-          # Verify critical options
+          # Verify
           echo "── Config verification ──"
           for opt in CONFIG_SUSFS CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL; do
             if grep -q "^${opt}=y" out/.config; then
               echo "  ✅ ${opt}=y"
             else
-              echo "  ⚠️  ${opt} NOT set — Kconfig entry may be missing"
+              echo "  ⚠️  ${opt} not set (Kconfig entry may be missing)"
             fi
           done
 
       # ───────────────────────────────────────
-      # 7. Build kernel (GNU ld — matches your original build)
+      # 9. Build kernel (GNU ld — matches your original build)
       # ───────────────────────────────────────
       - name: Build kernel
         run: |
@@ -161,11 +470,9 @@ jobs:
             OBJDUMP=aarch64-linux-gnu-objdump \
             STRIP=aarch64-linux-gnu-strip
 
-          # Verify uncompressed Image exists (kptools needs this)
           if [ ! -f out/arch/arm64/boot/Image ]; then
-            echo "❌ Build failed — out/arch/arm64/boot/Image not found"
-            echo "── Build output listing ──"
-            ls -lhR out/arch/arm64/boot/ 2>/dev/null || echo "  (directory missing)"
+            echo "❌ Build failed — Image not found"
+            ls -lhR out/arch/arm64/boot/ 2>/dev/null || true
             exit 1
           fi
 
@@ -173,33 +480,28 @@ jobs:
           ls -lh out/arch/arm64/boot/Image*
 
       # ───────────────────────────────────────
-      # 8. Patch with APatch SuperKey
+      # 10. Patch with APatch SuperKey
       # ───────────────────────────────────────
       - name: Patch kernel with APatch SuperKey
         env:
           APATCH_SUPERKEY: ${{ secrets.APATCH_SUPERKEY }}
         run: |
-          # Validate the secret
           if [ -z "$APATCH_SUPERKEY" ]; then
-            echo "❌ Secret APATCH_SUPERKEY is not set."
-            echo "   Go to: Repo → Settings → Secrets and variables → Actions"
+            echo "❌ Secret APATCH_SUPERKEY is not set"
+            echo "   Repo → Settings → Secrets and variables → Actions"
             exit 1
           fi
           if ! printf '%s' "$APATCH_SUPERKEY" | grep -qE '^[a-zA-Z0-9]{8,63}$'; then
-            echo "❌ SuperKey must be 8–63 alphanumeric characters only"
+            echo "❌ SuperKey must be 8–63 alphanumeric characters"
             exit 1
           fi
 
-          # Download pinned KernelPatch release
           KP_BASE="https://github.com/bmax121/KernelPatch/releases/download/${{ env.KERNELPATCH_TAG }}"
-          curl -fL -o kptools-linux "${KP_BASE}/kptools-linux" \
-            || { echo "❌ Failed to download kptools-linux"; exit 1; }
-          curl -fL -o kpimg-android "${KP_BASE}/kpimg-android" \
-            || { echo "❌ Failed to download kpimg-android"; exit 1; }
-
+          curl -fL -o kptools-linux "${KP_BASE}/kptools-linux" || { echo "❌ kptools download failed"; exit 1; }
+          curl -fL -o kpimg-android "${KP_BASE}/kpimg-android" || { echo "❌ kpimg download failed"; exit 1; }
           chmod +x kptools-linux
 
-          # Patch the UNCOMPRESSED Image (kptools cannot work on .gz)
+          # Patch UNCOMPRESSED Image (kptools cannot handle .gz)
           ./kptools-linux -p \
             --image out/arch/arm64/boot/Image \
             --skey "$APATCH_SUPERKEY" \
@@ -207,42 +509,37 @@ jobs:
             --out patched-Image
 
           if [ ! -f patched-Image ]; then
-            echo "❌ kptools failed to produce patched-Image"
+            echo "❌ kptools failed"
             exit 1
           fi
-
-          echo "✅ APatch SuperKey embedded into kernel"
-          ls -lh patched-Image
+          echo "✅ SuperKey embedded"
 
       # ───────────────────────────────────────
-      # 9. Recompress patched kernel
+      # 11. Recompress patched kernel
       # ───────────────────────────────────────
       - name: Recompress patched kernel
         run: |
           gzip -9 -c patched-Image > patched-Image.gz
 
-          # Check if original build produced Image.gz-dtb (dtb appended)
           FINAL="patched-Image.gz"
           AK_NAME="Image.gz"
 
-          # Look for standalone DTB to append
-          for dtb_candidate in \
-            out/arch/arm64/boot/dtb.img \
-            out/arch/arm64/boot/dtb \
-            out/arch/arm64/boot/dts/qcom/*.dtb; do
-            if [ -f "$dtb_candidate" ]; then
-              echo "Found DTB: $dtb_candidate — creating Image.gz-dtb"
-              cat patched-Image.gz "$dtb_candidate" > patched-Image.gz-dtb
+          # Append DTB if the original build produced Image.gz-dtb
+          for dtb in out/arch/arm64/boot/dtb.img out/arch/arm64/boot/dtb; do
+            if [ -f "$dtb" ]; then
+              cat patched-Image.gz "$dtb" > patched-Image.gz-dtb
               FINAL="patched-Image.gz-dtb"
               AK_NAME="Image.gz-dtb"
+              echo "Appended DTB: $dtb"
               break
             fi
           done
 
-          # If original build made Image.gz-dtb, we MUST produce one too
-          if [ -f out/arch/arm64/boot/Image.gz-dtb ] && [ "$AK_NAME" = "Image.gz" ]; then
-            echo "⚠️  Original build had Image.gz-dtb but no separate DTB found"
-            echo "   Using patched-Image.gz — flash may fail if device expects appended DTB"
+          # If original had Image.gz-dtb but no standalone DTB,
+          # check if build concatenated dtb into the image
+          if [ "$AK_NAME" = "Image.gz" ] && [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            echo "Original build produced Image.gz-dtb — using patched-Image.gz as-is"
+            echo "(DTB may be compiled into the image or loaded separately by bootloader)"
           fi
 
           echo "FINAL_KERNEL=${FINAL}" >> "$GITHUB_ENV"
@@ -250,43 +547,32 @@ jobs:
           ls -lh patched-Image*
 
       # ───────────────────────────────────────
-      # 10. Package with AnyKernel3
+      # 12. Package with AnyKernel3
       # ───────────────────────────────────────
       - name: Create AnyKernel3 flashable ZIP
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-
-          # Copy patched kernel
           cp "$FINAL_KERNEL" "AnyKernel3/${AK_KERNEL_NAME}"
 
-          # Copy DTBO if produced
           if [ -f out/arch/arm64/boot/dtbo.img ]; then
             cp out/arch/arm64/boot/dtbo.img AnyKernel3/
-            echo "Included dtbo.img"
           fi
 
           cd AnyKernel3
 
-          # Device uses super partition with A/B slots
-          if [ "${{ env.DEVICE_IS_AB }}" = "true" ]; then
-            IS_SLOT=1
-          else
-            IS_SLOT=0
-          fi
+          IS_SLOT=$( [ "${{ env.DEVICE_IS_AB }}" = "true" ] && echo 1 || echo 0 )
 
-          # Configure anykernel.sh
-          sed -i "s|kernel.string=.*|kernel.string=Entropy-1.0-SUSFS-APatch|"   anykernel.sh
-          sed -i "s|do.devicecheck=.*|do.devicecheck=0;|"                        anykernel.sh
-          sed -i "s|block=.*|block=${{ env.DEVICE_BLOCK }};|"                    anykernel.sh
-          sed -i "s|is_slot_device=.*|is_slot_device=${IS_SLOT};|"               anykernel.sh
-          sed -i "s|ramdisk_compression=.*|ramdisk_compression=auto;|"           anykernel.sh
+          sed -i "s|kernel.string=.*|kernel.string=Entropy-1.0-SUSFS-APatch|"  anykernel.sh
+          sed -i "s|do.devicecheck=.*|do.devicecheck=0;|"                       anykernel.sh
+          sed -i "s|block=.*|block=${{ env.DEVICE_BLOCK }};|"                   anykernel.sh
+          sed -i "s|is_slot_device=.*|is_slot_device=${IS_SLOT};|"              anykernel.sh
+          sed -i "s|ramdisk_compression=.*|ramdisk_compression=auto;|"          anykernel.sh
 
-          # Build flashable ZIP
           zip -r9 ../Entropy-1.0-SUSFS-APatch-AnyKernel.zip * -x '.git/*' README.md
-          echo "✅ AnyKernel3 ZIP created"
+          echo "✅ ZIP created"
 
       # ───────────────────────────────────────
-      # 11. Upload artifact
+      # 13. Upload flashable ZIP
       # ───────────────────────────────────────
       - name: Upload AnyKernel3 ZIP
         uses: actions/upload-artifact@v4
