@@ -1,0 +1,296 @@
+name: Build Entropy Kernel + SUSFS + APatch (SuperKey from Secret)
+
+on:
+  push:
+    branches: [ Entropy-1.0 ]
+  workflow_dispatch:
+
+# ════════════════════════════════════════════════════════════
+#  ⚙️  DEVICE / BUILD CONFIGURATION
+# ════════════════════════════════════════════════════════════
+env:
+  KERNEL_BRANCH: Entropy-1.0
+  DEFCONFIG: defconfig
+  SUSFS_BRANCH: kernel-4.19
+  EXPECTED_KERNEL_VERSION: "4.19"
+  KERNELPATCH_TAG: "0.11.1"
+  DEVICE_IS_AB: "true"
+  DEVICE_BLOCK: "/dev/block/bootdevice/by-name/boot"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ───────────────────────────────────────
+      # 1. Checkout kernel source
+      # ───────────────────────────────────────
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KERNEL_BRANCH }}
+          submodules: recursive
+          fetch-depth: 1
+
+      # ───────────────────────────────────────
+      # 2. Verify kernel version matches SUSFS
+      # ───────────────────────────────────────
+      - name: Verify kernel version
+        run: |
+          KVER=$(grep -m1 '^VERSION' Makefile | awk '{print $3}')
+          KPATCH=$(grep -m1 '^PATCHLEVEL' Makefile | awk '{print $3}')
+          DETECTED="${KVER}.${KPATCH}"
+          echo "Detected kernel version: ${DETECTED}"
+          if [ "${DETECTED}" != "${{ env.EXPECTED_KERNEL_VERSION }}" ]; then
+            echo "❌ Kernel is ${DETECTED} but SUSFS branch is for ${{ env.EXPECTED_KERNEL_VERSION }}"
+            exit 1
+          fi
+
+      # ───────────────────────────────────────
+      # 3. Install host build dependencies
+      # ───────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libelf-dev libssl-dev make python3 \
+            git curl wget xz-utils cpio zip \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+
+      # ───────────────────────────────────────
+      # 4. Download Clang r547379 (same as your original build)
+      # ───────────────────────────────────────
+      - name: Download Clang r547379
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+          if ! curl -fL --retry 3 --max-time 600 \
+               "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz" \
+               | tar -xzf - -C "$GITHUB_WORKSPACE/clang"; then
+            echo "❌ Clang download failed — try a mirror URL"
+            exit 1
+          fi
+
+          echo "PATH=$GITHUB_WORKSPACE/clang/bin:$PATH" >> "$GITHUB_ENV"
+          echo "── Clang version ──"
+          "$GITHUB_WORKSPACE/clang/bin/clang" --version || clang --version
+
+      # ───────────────────────────────────────
+      # 5. Download and apply SUSFS patches
+      # ───────────────────────────────────────
+      - name: Apply SUSFS patches
+        run: |
+          git clone -b "${{ env.SUSFS_BRANCH }}" --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs-source
+
+          # Copy SUSFS source files into kernel tree
+          cp -rv susfs-source/kernel_patches/fs/*            fs/            2>/dev/null || true
+          cp -rv susfs-source/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+
+          # Locate the integration patch
+          PATCH_FILE="susfs-source/kernel_patches/50_add_susfs_in_kernel-${{ env.EXPECTED_KERNEL_VERSION }}.patch"
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "❌ SUSFS patch not found: $PATCH_FILE"
+            echo "Available patches:"
+            ls susfs-source/kernel_patches/*.patch 2>/dev/null || echo "  (none)"
+            exit 1
+          fi
+
+          # Apply — must succeed or build stops
+          patch -p1 --forward < "$PATCH_FILE"
+          echo "✅ SUSFS patches applied successfully"
+
+      # ───────────────────────────────────────
+      # 6. Configure kernel
+      # ───────────────────────────────────────
+      - name: Configure kernel
+        run: |
+          DC_PATH="arch/arm64/configs/${{ env.DEFCONFIG }}"
+          if [ ! -f "$DC_PATH" ]; then
+            echo "❌ Defconfig not found: $DC_PATH"
+            echo "Available defconfigs:"
+            ls arch/arm64/configs/
+            exit 1
+          fi
+
+          mkdir -p out
+
+          # Generate base .config from your defconfig
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            ${{ env.DEFCONFIG }}
+
+          # Append SUSFS + APatch-required options
+          cat >> out/.config << 'EOF'
+          CONFIG_SUSFS=y
+          CONFIG_SUSFS_HIDE_KSU=y
+          CONFIG_SUSFS_SPOOF_UNAME=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          EOF
+
+          # Resolve all Kconfig dependencies
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          # Verify critical options
+          echo "── Config verification ──"
+          for opt in CONFIG_SUSFS CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL; do
+            if grep -q "^${opt}=y" out/.config; then
+              echo "  ✅ ${opt}=y"
+            else
+              echo "  ⚠️  ${opt} NOT set — Kconfig entry may be missing"
+            fi
+          done
+
+      # ───────────────────────────────────────
+      # 7. Build kernel (GNU ld — matches your original build)
+      # ───────────────────────────────────────
+      - name: Build kernel
+        run: |
+          make O=out ARCH=arm64 -j$(nproc) \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            LD=aarch64-linux-gnu-ld \
+            AR=aarch64-linux-gnu-ar \
+            NM=aarch64-linux-gnu-nm \
+            OBJCOPY=aarch64-linux-gnu-objcopy \
+            OBJDUMP=aarch64-linux-gnu-objdump \
+            STRIP=aarch64-linux-gnu-strip
+
+          # Verify uncompressed Image exists (kptools needs this)
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "❌ Build failed — out/arch/arm64/boot/Image not found"
+            echo "── Build output listing ──"
+            ls -lhR out/arch/arm64/boot/ 2>/dev/null || echo "  (directory missing)"
+            exit 1
+          fi
+
+          echo "✅ Kernel compiled successfully"
+          ls -lh out/arch/arm64/boot/Image*
+
+      # ───────────────────────────────────────
+      # 8. Patch with APatch SuperKey
+      # ───────────────────────────────────────
+      - name: Patch kernel with APatch SuperKey
+        env:
+          APATCH_SUPERKEY: ${{ secrets.APATCH_SUPERKEY }}
+        run: |
+          # Validate the secret
+          if [ -z "$APATCH_SUPERKEY" ]; then
+            echo "❌ Secret APATCH_SUPERKEY is not set."
+            echo "   Go to: Repo → Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          if ! printf '%s' "$APATCH_SUPERKEY" | grep -qE '^[a-zA-Z0-9]{8,63}$'; then
+            echo "❌ SuperKey must be 8–63 alphanumeric characters only"
+            exit 1
+          fi
+
+          # Download pinned KernelPatch release
+          KP_BASE="https://github.com/bmax121/KernelPatch/releases/download/${{ env.KERNELPATCH_TAG }}"
+          curl -fL -o kptools-linux "${KP_BASE}/kptools-linux" \
+            || { echo "❌ Failed to download kptools-linux"; exit 1; }
+          curl -fL -o kpimg-android "${KP_BASE}/kpimg-android" \
+            || { echo "❌ Failed to download kpimg-android"; exit 1; }
+
+          chmod +x kptools-linux
+
+          # Patch the UNCOMPRESSED Image (kptools cannot work on .gz)
+          ./kptools-linux -p \
+            --image out/arch/arm64/boot/Image \
+            --skey "$APATCH_SUPERKEY" \
+            --kpimg kpimg-android \
+            --out patched-Image
+
+          if [ ! -f patched-Image ]; then
+            echo "❌ kptools failed to produce patched-Image"
+            exit 1
+          fi
+
+          echo "✅ APatch SuperKey embedded into kernel"
+          ls -lh patched-Image
+
+      # ───────────────────────────────────────
+      # 9. Recompress patched kernel
+      # ───────────────────────────────────────
+      - name: Recompress patched kernel
+        run: |
+          gzip -9 -c patched-Image > patched-Image.gz
+
+          # Check if original build produced Image.gz-dtb (dtb appended)
+          FINAL="patched-Image.gz"
+          AK_NAME="Image.gz"
+
+          # Look for standalone DTB to append
+          for dtb_candidate in \
+            out/arch/arm64/boot/dtb.img \
+            out/arch/arm64/boot/dtb \
+            out/arch/arm64/boot/dts/qcom/*.dtb; do
+            if [ -f "$dtb_candidate" ]; then
+              echo "Found DTB: $dtb_candidate — creating Image.gz-dtb"
+              cat patched-Image.gz "$dtb_candidate" > patched-Image.gz-dtb
+              FINAL="patched-Image.gz-dtb"
+              AK_NAME="Image.gz-dtb"
+              break
+            fi
+          done
+
+          # If original build made Image.gz-dtb, we MUST produce one too
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ] && [ "$AK_NAME" = "Image.gz" ]; then
+            echo "⚠️  Original build had Image.gz-dtb but no separate DTB found"
+            echo "   Using patched-Image.gz — flash may fail if device expects appended DTB"
+          fi
+
+          echo "FINAL_KERNEL=${FINAL}" >> "$GITHUB_ENV"
+          echo "AK_KERNEL_NAME=${AK_NAME}" >> "$GITHUB_ENV"
+          ls -lh patched-Image*
+
+      # ───────────────────────────────────────
+      # 10. Package with AnyKernel3
+      # ───────────────────────────────────────
+      - name: Create AnyKernel3 flashable ZIP
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+
+          # Copy patched kernel
+          cp "$FINAL_KERNEL" "AnyKernel3/${AK_KERNEL_NAME}"
+
+          # Copy DTBO if produced
+          if [ -f out/arch/arm64/boot/dtbo.img ]; then
+            cp out/arch/arm64/boot/dtbo.img AnyKernel3/
+            echo "Included dtbo.img"
+          fi
+
+          cd AnyKernel3
+
+          # Device uses super partition with A/B slots
+          if [ "${{ env.DEVICE_IS_AB }}" = "true" ]; then
+            IS_SLOT=1
+          else
+            IS_SLOT=0
+          fi
+
+          # Configure anykernel.sh
+          sed -i "s|kernel.string=.*|kernel.string=Entropy-1.0-SUSFS-APatch|"   anykernel.sh
+          sed -i "s|do.devicecheck=.*|do.devicecheck=0;|"                        anykernel.sh
+          sed -i "s|block=.*|block=${{ env.DEVICE_BLOCK }};|"                    anykernel.sh
+          sed -i "s|is_slot_device=.*|is_slot_device=${IS_SLOT};|"               anykernel.sh
+          sed -i "s|ramdisk_compression=.*|ramdisk_compression=auto;|"           anykernel.sh
+
+          # Build flashable ZIP
+          zip -r9 ../Entropy-1.0-SUSFS-APatch-AnyKernel.zip * -x '.git/*' README.md
+          echo "✅ AnyKernel3 ZIP created"
+
+      # ───────────────────────────────────────
+      # 11. Upload artifact
+      # ───────────────────────────────────────
+      - name: Upload AnyKernel3 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Entropy-1.0-SUSFS-APatch-AnyKernel
+          path: Entropy-1.0-SUSFS-APatch-AnyKernel.zip
+          retention-days: 14
