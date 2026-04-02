@@ -16,7 +16,7 @@ on:
 jobs:
   build:
     name: "phoeniX | SM8250 | ReSukiSU + SuSFS"
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       # ─── 1. Checkout kernel source ───────────────────────────────────
@@ -394,6 +394,11 @@ jobs:
       - name: Compile kernel
         working-directory: kernel
         run: |
+          # pipefail ensures make's exit code propagates through the tee pipe.
+          # Without this, a failed build returns 0 (tee's exit code) and the
+          # step silently passes — the missing Image is only caught much later.
+          set -o pipefail
+
           CLANG_BIN=$(pwd)/toolchain/clang/bin
           CROSS_COMPILE=$(pwd)/toolchain/aarch64-linux-android-4.9/bin/aarch64-linux-android-
           OUT_DIR=$(pwd)/out
@@ -423,6 +428,25 @@ jobs:
                -j$(nproc --all) 2>&1 | tee build.log
 
           echo "✔ Kernel build complete"
+
+      # Print errors inline so they're visible in the Actions summary
+      # without needing to download the build log artifact.
+      - name: Show build errors (on failure)
+        if: failure()
+        working-directory: kernel
+        run: |
+          if [ ! -f build.log ]; then
+            echo "build.log not found — make did not start"
+            exit 0
+          fi
+          echo "──────────────────────────────────────"
+          echo " Last 120 lines of build.log"
+          echo "──────────────────────────────────────"
+          tail -n 120 build.log
+          echo ""
+          echo "── Filtered errors ───────────────────"
+          grep -nE "error:|undefined reference|cannot find|fatal:|ld:" build.log \
+            | tail -n 50 || echo "(no error lines matched)"
 
       # ─── 11. Verify boot artifacts ───────────────────────────────────
       - name: Verify boot artifacts
