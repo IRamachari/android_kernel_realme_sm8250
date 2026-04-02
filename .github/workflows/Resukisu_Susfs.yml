@@ -295,7 +295,7 @@ jobs:
         run: |
           git clone --depth=1 \
             -b ${{ inputs.susfs_branch }} \
-            https://gitlab.com/simonpunk/susfs4ksu.git \
+            https://github.com/ShirkNeko/susfs4ksu.git \
             /tmp/susfs4ksu
 
       - name: Apply SuSFS kernel patches
