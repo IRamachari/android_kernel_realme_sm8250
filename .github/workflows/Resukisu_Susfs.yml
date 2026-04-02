@@ -321,7 +321,8 @@ jobs:
 
           echo "→ Copying susfs source files"
           cp -v "$PATCH_DIR/fs/susfs.c"            fs/            2>/dev/null || true
-          cp -v "$PATCH_DIR/include/linux/susfs.h" include/linux/ 2>/dev/null || true
+          cp -v "$PATCH_DIR/include/linux/susfs.h"     include/linux/ 2>/dev/null || true
+          cp -v "$PATCH_DIR/include/linux/susfs_def.h" include/linux/ 2>/dev/null || true
 
           echo "✔ SuSFS patches applied"
 
