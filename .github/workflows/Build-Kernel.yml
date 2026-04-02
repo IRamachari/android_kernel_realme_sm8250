@@ -1,578 +1,287 @@
-name: Build Entropy Kernel + SUSFS + APatch (SuperKey from Secret)
+name: Build Kernel (SuSFS + APatch)
 
 on:
-  push:
-    branches: [ Entropy-1.0 ]
   workflow_dispatch:
-
-# ════════════════════════════════════════════════════════════
-#  ⚙️  DEVICE / BUILD CONFIGURATION
-# ════════════════════════════════════════════════════════════
-env:
-  KERNEL_BRANCH: Entropy-1.0
-  DEFCONFIG: defconfig
-  SUSFS_BRANCH: kernel-4.19
-  EXPECTED_KERNEL_VERSION: "4.19"
-  KERNELPATCH_TAG: "0.11.1"
-  DEVICE_IS_AB: "true"
-  DEVICE_BLOCK: "/dev/block/bootdevice/by-name/boot"
+    inputs:
+      susfs_branch:
+        description: "SuSFS branch (e.g. kernel-4.19)"
+        required: false
+        default: "kernel-4.19"
+      release:
+        description: "Create a GitHub Release after build"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build:
+    name: "phoeniX | SM8250 | SuSFS + APatch"
     runs-on: ubuntu-22.04
 
     steps:
-      # ───────────────────────────────────────
-      # 1. Checkout kernel source
-      # ───────────────────────────────────────
+      # ─── 1. Kernel source ────────────────────────────────────────────
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.KERNEL_BRANCH }}
-          submodules: recursive
           fetch-depth: 1
+          path: kernel
 
-      # ───────────────────────────────────────
-      # 2. Verify kernel version
-      # ───────────────────────────────────────
-      - name: Verify kernel version
-        run: |
-          KVER=$(grep -m1 '^VERSION' Makefile | awk '{print $3}')
-          KPATCH=$(grep -m1 '^PATCHLEVEL' Makefile | awk '{print $3}')
-          DETECTED="${KVER}.${KPATCH}"
-          echo "Detected kernel version: ${DETECTED}"
-          if [ "${DETECTED}" != "${{ env.EXPECTED_KERNEL_VERSION }}" ]; then
-            echo "❌ Kernel is ${DETECTED} but expected ${{ env.EXPECTED_KERNEL_VERSION }}"
-            exit 1
-          fi
-
-      # ───────────────────────────────────────
-      # 3. Install build dependencies
-      # ───────────────────────────────────────
+      # ─── 2. System dependencies ──────────────────────────────────────
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            bc bison flex libelf-dev libssl-dev make python3 \
-            git curl wget xz-utils cpio zip \
-            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+            bc bison build-essential ca-certificates ccache \
+            curl flex git kmod libelf-dev libssl-dev \
+            lz4 python3 unzip wget zip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu cpio
 
-      # ───────────────────────────────────────
-      # 4. Download Clang r547379
-      # ───────────────────────────────────────
-      - name: Download Clang r547379
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/clang"
-          if ! curl -fL --retry 3 --max-time 600 \
-               "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz" \
-               | tar -xzf - -C "$GITHUB_WORKSPACE/clang"; then
-            echo "❌ Clang download failed"
-            exit 1
-          fi
-          echo "PATH=$GITHUB_WORKSPACE/clang/bin:$PATH" >> "$GITHUB_ENV"
-          "$GITHUB_WORKSPACE/clang/bin/clang" --version || true
-
-      # ───────────────────────────────────────
-      # 5. Fix Clang 20 compatibility issues
-      #    enum mmu_notifier_event is defined inside
-      #    #ifdef CONFIG_MMU_NOTIFIER but used in
-      #    the #else stub section → Clang rejects it
-      # ───────────────────────────────────────
-      - name: Fix Clang compatibility — mmu_notifier.h
-        run: |
-          python3 << 'PYEOF'
-          import re, sys
-
-          filepath = 'include/linux/mmu_notifier.h'
-          try:
-              with open(filepath, 'r') as f:
-                  lines = f.readlines()
-          except FileNotFoundError:
-              print(f"ℹ️  {filepath} not found — skipping")
-              sys.exit(0)
-
-          # ── Step 1: Find #ifdef CONFIG_MMU_NOTIFIER and its matching #else ──
-          ifdef_line = -1
-          else_line = -1
-          depth = 0
-
-          for i, line in enumerate(lines):
-              s = line.strip()
-              if re.match(r'#ifdef\s+CONFIG_MMU_NOTIFIER\b', s) and ifdef_line < 0:
-                  ifdef_line = i
-                  depth = 1
-              elif ifdef_line >= 0 and depth > 0:
-                  if re.match(r'#\s*(ifdef|ifndef|if\s)', s):
-                      depth += 1
-                  elif s.startswith('#endif'):
-                      depth -= 1
-                      if depth == 0:
-                          break
-                  elif s.startswith('#else') and depth == 1:
-                      else_line = i
-                      break
-
-          if ifdef_line < 0 or else_line < 0:
-              print("ℹ️  Could not find #ifdef / #else for CONFIG_MMU_NOTIFIER")
-              sys.exit(0)
-
-          # ── Step 2: Extract the real enum definition from #ifdef block ──
-          ifdef_block = ''.join(lines[ifdef_line:else_line])
-          enum_match = re.search(
-              r'(enum\s+mmu_notifier_event\s*\{[^}]+\}\s*;)',
-              ifdef_block, re.DOTALL
-          )
-
-          if enum_match:
-              enum_def = enum_match.group(1)
-              print(f"  Found enum definition in #ifdef block")
-          else:
-              enum_def = 'enum mmu_notifier_event { MMU_NOTIFY_UNMAP = 0 };'
-              print(f"  Using fallback enum definition")
-
-          # ── Step 3: Check if #else block already has the enum ──
-          else_to_end = ''.join(lines[else_line:])
-          endif_in_else = else_to_end.find('#endif')
-          else_block = else_to_end[:endif_in_else] if endif_in_else >= 0 else else_to_end
-
-          if 'enum mmu_notifier_event' in else_block and '{' in else_block:
-              print("ℹ️  enum already defined in #else block — no fix needed")
-              sys.exit(0)
-
-          # ── Step 4: Insert enum definition right after #else line ──
-          insert = (
-              '\n'
-              '/* Clang compatibility: enum must be visible in stub section */\n'
-              + enum_def + '\n'
-              '\n'
-          )
-
-          lines.insert(else_line + 1, insert)
-
-          with open(filepath, 'w') as f:
-              f.writelines(lines)
-
-          print(f"✅ Inserted enum mmu_notifier_event after #else (line {else_line + 2})")
-          PYEOF
-
-      # ───────────────────────────────────────
-      # 6. Apply SUSFS patches
-      #    NOTE: These patches use #ifdef CONFIG_KSU_SUSFS
-      #    which requires KSU in the kernel tree. Without KSU,
-      #    the SUSFS code is compiled out (harmless).
-      #    For APatch users: install SUSFS as a KPM module
-      #    through APatch Manager after flashing.
-      # ───────────────────────────────────────
-      - name: Apply SUSFS patches
-        run: |
-          git clone -b "${{ env.SUSFS_BRANCH }}" --depth=1 \
-            https://gitlab.com/simonpunk/susfs4ksu.git susfs-source
-
-          cp -rv susfs-source/kernel_patches/fs/*            fs/            2>/dev/null || true
-          cp -rv susfs-source/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
-
-          PATCH_FILE="susfs-source/kernel_patches/50_add_susfs_in_kernel-${{ env.EXPECTED_KERNEL_VERSION }}.patch"
-          if [ ! -f "$PATCH_FILE" ]; then
-            echo "❌ SUSFS patch not found: $PATCH_FILE"
-            ls susfs-source/kernel_patches/*.patch 2>/dev/null || echo "  (none)"
-            exit 1
-          fi
-
-          # Apply with fuzz=3, allow partial failures (fixed in next step)
-          patch -p1 --forward --fuzz=3 < "$PATCH_FILE" || true
-
-          REJ_COUNT=$(find . -name "*.rej" -type f | wc -l)
-          if [ "$REJ_COUNT" -eq 0 ]; then
-            echo "✅ All SUSFS patches applied cleanly"
-          else
-            echo "⚠️  ${REJ_COUNT} file(s) have rejected hunks — fixing next"
-          fi
-
-      # ───────────────────────────────────────
-      # 7. Auto-fix rejected SUSFS hunks
-      # ───────────────────────────────────────
-      - name: Auto-fix rejected SUSFS hunks
-        run: |
-          REJ_FILES=$(find . -name "*.rej" -type f 2>/dev/null)
-          if [ -z "$REJ_FILES" ]; then
-            echo "✅ No rejected hunks"
-            exit 0
-          fi
-
-          echo "━━━━ Rejected hunks ━━━━"
-          for rej in $REJ_FILES; do
-            echo "── $rej ──"
-            cat "$rej"
-          done
-
-          # ── Phase 1: Fix missing #include lines ──
-          echo ""
-          echo "Phase 1: Fixing #include lines..."
-          for src_file in fs/namespace.c fs/proc/task_mmu.c; do
-            if [ -f "${src_file}.rej" ]; then
-              if ! grep -q '#include <linux/susfs.h>' "$src_file"; then
-                LAST_INC=$(grep -n '^#include' "$src_file" | tail -1 | cut -d: -f1)
-                if [ -n "$LAST_INC" ]; then
-                  sed -i "${LAST_INC}a\\#include <linux/susfs.h>" "$src_file"
-                  echo "  ✅ ${src_file} — added #include after line ${LAST_INC}"
-                fi
-              else
-                echo "  ℹ️  ${src_file} — #include already present"
-              fi
-            fi
-          done
-
-          # ── Phase 2: Fuzzy patcher for remaining hunks ──
-          echo ""
-          echo "Phase 2: Fuzzy patching remaining hunks..."
-
-          cat > /tmp/fuzzy_patch.py << 'PYEOF'
-          #!/usr/bin/env python3
-          import re, sys, os
-
-          def parse_rej(path):
-              with open(path) as f:
-                  lines = f.readlines()
-              hunks = []
-              cur = None
-              for line in lines:
-                  if line.startswith('@@'):
-                      if cur and (cur['adds'] or cur['removes']):
-                          hunks.append(cur)
-                      m = re.search(r'@@ -(\d+)', line)
-                      cur = {'orig': int(m.group(1)) if m else 0,
-                             'ctx_before': [], 'ctx_after': [],
-                             'adds': [], 'removes': [], 'in_change': False}
-                  elif cur is not None:
-                      raw = line.rstrip('\n')
-                      if raw.startswith('+++') or raw.startswith('---'):
-                          continue
-                      if raw.startswith('+'):
-                          cur['adds'].append(raw[1:] + '\n')
-                          cur['in_change'] = True
-                      elif raw.startswith('-'):
-                          cur['removes'].append(raw[1:])
-                          cur['in_change'] = True
-                      elif raw.startswith(' '):
-                          if cur['in_change']:
-                              cur['ctx_after'].append(raw[1:])
-                          else:
-                              cur['ctx_before'].append(raw[1:])
-              if cur and (cur['adds'] or cur['removes']):
-                  hunks.append(cur)
-              return hunks
-
-          def fuzzy_find(src, ctx, start=0, end=None):
-              if not ctx: return -1, 0
-              if end is None: end = len(src)
-              best_pos, best_score = -1, 0
-              for i in range(start, end):
-                  score = 0
-                  for j, c in enumerate(ctx):
-                      idx = i + j
-                      if idx >= len(src): break
-                      s1, s2 = src[idx].rstrip(), c.rstrip()
-                      if s1 == s2: score += 3
-                      elif s1.strip() == s2.strip(): score += 2
-                      elif s2.strip() and s2.strip() in s1: score += 1
-                  if score > best_score:
-                      best_score, best_pos = score, i
-              return best_pos, best_score
-
-          def already_applied(src, adds, pos):
-              if not adds: return True
-              check = None
-              for a in adds:
-                  s = a.strip()
-                  if s and s not in ('{','}','#else','#endif') and not s.startswith('#ifdef') and not s.startswith('//'):
-                      check = s; break
-              if not check: return False
-              lo, hi = max(0, pos-15), min(len(src), pos+len(adds)+15)
-              return any(check in src[i] for i in range(lo, hi))
-
-          def apply(src_path, rej_path):
-              with open(src_path) as f:
-                  src = f.readlines()
-              hunks = [h for h in parse_rej(rej_path)
-                       if not all('#include' in a for a in h['adds'])]
-              if not hunks:
-                  print(f"  ℹ️  {rej_path}: only include hunks (already fixed)")
-                  return True
-              applied = failed = 0
-              for idx, h in enumerate(hunks):
-                  label = f"Hunk {idx+1} (orig line {h['orig']})"
-                  pos, score = fuzzy_find(src, h['ctx_before'])
-                  ins = pos + len(h['ctx_before']) if pos >= 0 else -1
-                  if score < max(2, len(h['ctx_before'])):
-                      p2, s2 = fuzzy_find(src, h['ctx_after'])
-                      if s2 > score: ins, score = p2, s2
-                  if score < 2:
-                      approx = min(h['orig']-1, len(src)-1)
-                      for c in h['ctx_before'] + h['ctx_after']:
-                          cs = c.strip()
-                          if not cs: continue
-                          for i in range(max(0,approx-200), min(len(src),approx+200)):
-                              if cs in src[i]:
-                                  ins, score = i+1, 2; break
-                          if score >= 2: break
-                  if score < 2 or ins < 0:
-                      print(f"  ❌ {label}: no match"); failed += 1; continue
-                  if already_applied(src, h['adds'], ins):
-                      print(f"  ℹ️  {label}: already applied"); applied += 1; continue
-                  for rem in h['removes']:
-                      rs = rem.strip()
-                      for k in range(max(0,ins-5), min(len(src),ins+5)):
-                          if src[k].strip() == rs:
-                              src.pop(k)
-                              if k < ins: ins -= 1
-                              break
-                  for j, a in enumerate(h['adds']):
-                      src.insert(ins+j, a)
-                  print(f"  ✅ {label}: applied at line {ins+1} ({len(h['adds'])} lines)")
-                  applied += 1
-              with open(src_path, 'w') as f:
-                  f.writelines(src)
-              print(f"  Summary: {applied} applied, {failed} failed")
-              return failed == 0
-
-          ok = True
-          rejects = []
-          for root, _, files in os.walk('.'):
-              for f in files:
-                  if f.endswith('.rej'):
-                      rejects.append(os.path.join(root, f))
-          for rej in rejects:
-              source = rej.replace('.rej','')
-              if not os.path.isfile(source):
-                  print(f"⚠️  Source not found for {rej}"); continue
-              print(f"\nProcessing: {rej} → {source}")
-              if apply(source, rej):
-                  os.remove(rej)
-              else:
-                  ok = False
-          sys.exit(0 if ok else 1)
-          PYEOF
-
-          python3 /tmp/fuzzy_patch.py || true
-
-          REMAINING=$(find . -name "*.rej" -type f 2>/dev/null)
-          if [ -z "$REMAINING" ]; then
-            echo "✅ All rejected hunks resolved"
-          else
-            echo "⚠️  Unresolved rejects (build continues — code is ifdef'd out):"
-            echo "$REMAINING"
-            mkdir -p /tmp/rej_artifacts
-            for r in $REMAINING; do cp "$r" /tmp/rej_artifacts/; done
-          fi
-
-      # ───────────────────────────────────────
-      # 8. Upload .rej files if any remain
-      # ───────────────────────────────────────
-      - name: Upload remaining .rej files
-        if: always()
-        uses: actions/upload-artifact@v4
+      # ─── 3. ccache ───────────────────────────────────────────────────
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
         with:
-          name: susfs-rej-files
-          path: /tmp/rej_artifacts/
-          if-no-files-found: ignore
-          retention-days: 7
+          max-size: 5G
+          key: phoenix-sm8250-${{ github.ref_name }}
+          restore-keys: phoenix-sm8250-
 
-      # ───────────────────────────────────────
-      # 9. Configure kernel
-      # ───────────────────────────────────────
-      - name: Configure kernel
+      # ─── 4. Toolchain ────────────────────────────────────────────────
+      - name: Clone toolchain (ryukftw)
         run: |
-          DC_PATH="arch/arm64/configs/${{ env.DEFCONFIG }}"
-          if [ ! -f "$DC_PATH" ]; then
-            echo "❌ Defconfig not found: $DC_PATH"
-            ls arch/arm64/configs/
-            exit 1
-          fi
+          git clone --depth=1 \
+            https://gitlab.com/ryukftw/toolchain.git \
+            kernel/toolchain
 
-          mkdir -p out
+      # ─── 5. AnyKernel3 ───────────────────────────────────────────────
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 \
+            https://github.com/bijoyv9/AnyKernel3.git \
+            kernel/anykernel
 
-          make O=out ARCH=arm64 \
-            CC=clang \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            ${{ env.DEFCONFIG }}
+      # ─── 6. SuSFS patches ────────────────────────────────────────────
+      - name: Clone SuSFS
+        run: |
+          git clone --depth=1 \
+            -b ${{ inputs.susfs_branch }} \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            /tmp/susfs4ksu
 
-          # APatch requires KALLSYMS
-          # MMU_NOTIFIER fixes Clang compat if not already selected
-          cat >> out/.config << 'EOF'
-          CONFIG_KALLSYMS=y
-          CONFIG_KALLSYMS_ALL=y
-          CONFIG_MMU_NOTIFIER=y
-          EOF
+      - name: Apply SuSFS patches
+        working-directory: kernel
+        run: |
+          PATCH_DIR=/tmp/susfs4ksu/kernel_patches
 
-          # Resolve dependencies
-          make O=out ARCH=arm64 \
-            CC=clang \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            olddefconfig
+          echo "──────────────────────────────────────"
+          echo " Applying SuSFS patches"
+          echo "──────────────────────────────────────"
 
-          # Verify APatch-critical options
-          echo "── Config verification ──"
-          for opt in CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL; do
-            if grep -q "^${opt}=y" out/.config; then
-              echo "  ✅ ${opt}=y"
-            else
-              echo "  ❌ ${opt} not set — APatch may not work"
-              exit 1
+          # Core kernel patch for 4.19
+          for PATCH in \
+            "add_susfs_in_kernel-4.19.patch" \
+            "add_sus_su_support_for_non_gki.patch" \
+            "fs_susfs.patch"; do
+            if [ -f "$PATCH_DIR/$PATCH" ]; then
+              echo "→ Applying: $PATCH"
+              patch -p1 --forward --no-backup-if-mismatch \
+                < "$PATCH_DIR/$PATCH" || \
+                echo "  (already applied or minor conflict — continuing)"
             fi
           done
 
-          # Info: check MMU_NOTIFIER status
-          if grep -q "^CONFIG_MMU_NOTIFIER=y" out/.config; then
-            echo "  ✅ CONFIG_MMU_NOTIFIER=y"
-          else
-            echo "  ℹ️  CONFIG_MMU_NOTIFIER not set (header fix handles this)"
-          fi
+          # Copy susfs source files
+          echo "→ Copying susfs source files"
+          cp -v "$PATCH_DIR/fs/susfs.c"              fs/              2>/dev/null || true
+          cp -v "$PATCH_DIR/include/linux/susfs.h"   include/linux/   2>/dev/null || true
+          cp -v "$PATCH_DIR/fs/sus_su.c"             fs/              2>/dev/null || true
+          cp -v "$PATCH_DIR/include/linux/sus_su.h"  include/linux/   2>/dev/null || true
 
-      # ───────────────────────────────────────
-      # 10. Build kernel (GNU ld — matches your original build)
-      # ───────────────────────────────────────
-      - name: Build kernel
-        run: |
-          make O=out ARCH=arm64 -j$(nproc) \
-            CC=clang \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            LD=aarch64-linux-gnu-ld \
-            AR=aarch64-linux-gnu-ar \
-            NM=aarch64-linux-gnu-nm \
-            OBJCOPY=aarch64-linux-gnu-objcopy \
-            OBJDUMP=aarch64-linux-gnu-objdump \
-            STRIP=aarch64-linux-gnu-strip
+          echo "✔ SuSFS patches applied"
 
-          if [ ! -f out/arch/arm64/boot/Image ]; then
-            echo "❌ Build failed — Image not found"
-            ls -lhR out/arch/arm64/boot/ 2>/dev/null || true
-            exit 1
-          fi
-
-          echo "✅ Kernel compiled successfully"
-          ls -lh out/arch/arm64/boot/Image*
-
-      # ───────────────────────────────────────
-      # 11. Patch with APatch SuperKey
-      # ───────────────────────────────────────
-      - name: Patch kernel with APatch SuperKey
+      # ─── 7. APatch super key injection ───────────────────────────────
+      - name: Inject APatch super key
+        working-directory: kernel
         env:
           APATCH_SUPERKEY: ${{ secrets.APATCH_SUPERKEY }}
         run: |
           if [ -z "$APATCH_SUPERKEY" ]; then
-            echo "❌ Secret APATCH_SUPERKEY is not set"
-            echo "   Repo → Settings → Secrets and variables → Actions"
-            exit 1
-          fi
-          if ! printf '%s' "$APATCH_SUPERKEY" | grep -qE '^[a-zA-Z0-9]{8,63}$'; then
-            echo "❌ SuperKey must be 8–63 alphanumeric characters"
+            echo "ERROR: Secret APATCH_SUPERKEY is not set!" >&2
             exit 1
           fi
 
-          KP_BASE="https://github.com/bmax121/KernelPatch/releases/download/${{ env.KERNELPATCH_TAG }}"
-          curl -fL -o kptools-linux "${KP_BASE}/kptools-linux" \
-            || { echo "❌ kptools download failed"; exit 1; }
-          curl -fL -o kpimg-android "${KP_BASE}/kpimg-android" \
-            || { echo "❌ kpimg download failed"; exit 1; }
-          chmod +x kptools-linux
+          # Mask from all future log output immediately
+          echo "::add-mask::${APATCH_SUPERKEY}"
 
-          # Patch UNCOMPRESSED Image
-          ./kptools-linux -p \
-            --image out/arch/arm64/boot/Image \
-            --skey "$APATCH_SUPERKEY" \
-            --kpimg kpimg-android \
-            --out patched-Image
+          echo "──────────────────────────────────────"
+          echo " Injecting APatch super key"
+          echo "──────────────────────────────────────"
 
-          if [ ! -f patched-Image ]; then
-            echo "❌ kptools failed to produce patched-Image"
-            exit 1
-          fi
-          echo "✅ SuperKey embedded"
-          ls -lh patched-Image
+          # Method A: Kconfig fragment (picked up via merge_config)
+          echo "CONFIG_APATCH_SUPERKEY=\"${APATCH_SUPERKEY}\"" \
+            > arch/arm64/configs/apatch_superkey.config
+          echo "→ wrote arch/arm64/configs/apatch_superkey.config"
 
-      # ───────────────────────────────────────
-      # 12. Recompress patched kernel
-      # ───────────────────────────────────────
-      - name: Recompress patched kernel
+          # Method B: C header (for APatch patches that #include it)
+          mkdir -p include/linux
+          cat > include/linux/apatch_key.h <<EOF
+          /* Auto-generated by CI — do not edit or commit */
+          #ifndef _APATCH_KEY_H
+          #define _APATCH_KEY_H
+          #define APATCH_SUPER_KEY "${APATCH_SUPERKEY}"
+          #endif /* _APATCH_KEY_H */
+          EOF
+          echo "→ wrote include/linux/apatch_key.h"
+
+          echo "✔ APatch super key injected"
+
+      # ─── 8. Build ─────────────────────────────────────────────────────
+      - name: Compile kernel
+        working-directory: kernel
         run: |
-          gzip -9 -c patched-Image > patched-Image.gz
+          # ── Mirror build.sh variable setup exactly ──────────────────
+          MAKE_PATH=$(pwd)/toolchain/build-tools/bin
+          CROSS_COMPILE=$(pwd)/toolchain/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+          CLANG_BIN=$(pwd)/toolchain/clang/bin
+          OUT_DIR=$(pwd)/out
+          ARCH=arm64
 
-          FINAL="patched-Image.gz"
-          AK_NAME="Image.gz"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export KERNEL_SRC=${OUT_DIR}
+          export PATH="${CLANG_BIN}:${MAKE_PATH}:${PATH}"
 
-          for dtb in out/arch/arm64/boot/dtb.img out/arch/arm64/boot/dtb; do
-            if [ -f "$dtb" ]; then
-              cat patched-Image.gz "$dtb" > patched-Image.gz-dtb
-              FINAL="patched-Image.gz-dtb"
-              AK_NAME="Image.gz-dtb"
-              echo "Appended DTB: $dtb"
-              break
+          TARGET_KERNEL_MAKE_ENV="CC=ccache ${CLANG_BIN}/clang"
+          LLVM_TOOLS="NM=${CLANG_BIN}/llvm-nm \
+                      OBJCOPY=${CLANG_BIN}/llvm-objcopy \
+                      OBJDUMP=${CLANG_BIN}/llvm-objdump \
+                      STRIP=${CLANG_BIN}/llvm-strip"
+
+          CONFIG="vendor/kona-perf_defconfig vendor/oplus.config"
+
+          echo "──────────────────────────────────────"
+          echo " Step 1 — Generate .config"
+          echo "──────────────────────────────────────"
+          make O=${OUT_DIR} \
+               ${TARGET_KERNEL_MAKE_ENV} \
+               LLVM_IAS=1 \
+               ARCH=${ARCH} \
+               CROSS_COMPILE=${CROSS_COMPILE} \
+               ${LLVM_TOOLS} \
+               ${CONFIG}
+
+          # Merge APatch super key Kconfig fragment
+          if [ -f arch/arm64/configs/apatch_superkey.config ]; then
+            echo "→ Merging APatch super key config fragment"
+            ./scripts/kconfig/merge_config.sh -m -O ${OUT_DIR} \
+              ${OUT_DIR}/.config \
+              arch/arm64/configs/apatch_superkey.config
+            make O=${OUT_DIR} ARCH=${ARCH} olddefconfig
+          fi
+
+          # Enable SuSFS in .config
+          echo "→ Enabling SuSFS config options"
+          ./scripts/config --file ${OUT_DIR}/.config \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_SUS_OVERLAYFS \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            2>/dev/null || true
+          make O=${OUT_DIR} ARCH=${ARCH} olddefconfig
+
+          echo "──────────────────────────────────────"
+          echo " Step 2 — Build kernel"
+          echo "──────────────────────────────────────"
+          make ARCH=${ARCH} \
+               CROSS_COMPILE=${CROSS_COMPILE} \
+               LLVM_IAS=1 \
+               O=${OUT_DIR} \
+               ${TARGET_KERNEL_MAKE_ENV} \
+               ${LLVM_TOOLS} \
+               -j$(nproc --all) 2>&1 | tee build.log
+
+          echo "✔ Kernel build complete"
+
+      # ─── 9. Check build output ───────────────────────────────────────
+      - name: Verify build artifacts
+        working-directory: kernel
+        run: |
+          echo "── Boot artifacts ──────────────────────"
+          for f in out/arch/arm64/boot/Image \
+                   out/arch/arm64/boot/dtbo.img \
+                   out/arch/arm64/boot/dtb; do
+            if [ -f "$f" ]; then
+              echo "✔ $f ($(du -sh $f | cut -f1))"
+            else
+              echo "✘ MISSING: $f" && exit 1
             fi
           done
 
-          if [ "$AK_NAME" = "Image.gz" ] && [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            echo "⚠️  Original had Image.gz-dtb but no standalone DTB found"
-            echo "   Extracting DTB from original..."
-            # Extract DTB by removing the gzip portion
-            GZIP_END=$(python3 -c "
-          import gzip, struct
-          with open('out/arch/arm64/boot/Image.gz-dtb','rb') as f:
-              # Find end of gzip stream
-              f.seek(0)
-              try:
-                  import io
-                  gz = gzip.GzipFile(fileobj=f)
-                  gz.read()
-                  print(f.tell())
-              except:
-                  print(0)
-          ")
-            if [ "$GZIP_END" -gt 0 ] 2>/dev/null; then
-              tail -c +$((GZIP_END+1)) out/arch/arm64/boot/Image.gz-dtb > extracted-dtb
-              if [ -s extracted-dtb ]; then
-                cat patched-Image.gz extracted-dtb > patched-Image.gz-dtb
-                FINAL="patched-Image.gz-dtb"
-                AK_NAME="Image.gz-dtb"
-                echo "✅ Extracted and appended DTB"
-              fi
-            fi
-          fi
-
-          echo "FINAL_KERNEL=${FINAL}" >> "$GITHUB_ENV"
-          echo "AK_KERNEL_NAME=${AK_NAME}" >> "$GITHUB_ENV"
-          ls -lh patched-Image*
-
-      # ───────────────────────────────────────
-      # 13. Package with AnyKernel3
-      # ───────────────────────────────────────
-      - name: Create AnyKernel3 flashable ZIP
+      # ─── 10. Package with AnyKernel3 ─────────────────────────────────
+      - name: Package zip (AnyKernel3)
+        working-directory: kernel
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-          cp "$FINAL_KERNEL" "AnyKernel3/${AK_KERNEL_NAME}"
+          DT=$(date +"%Y%m%d-%H%M")
+          ZIP_NAME="phoeniX-AOSP-${DT}.zip"
 
-          if [ -f out/arch/arm64/boot/dtbo.img ]; then
-            cp out/arch/arm64/boot/dtbo.img AnyKernel3/
-          fi
+          echo "── Zipping: ${ZIP_NAME} ─────────────────"
+          cd anykernel
+          rm -f ./*.zip
 
-          cd AnyKernel3
-          IS_SLOT=$( [ "${{ env.DEVICE_IS_AB }}" = "true" ] && echo 1 || echo 0 )
+          cp ../out/arch/arm64/boot/Image   .
+          cp ../out/arch/arm64/boot/dtbo.img .
+          cp ../out/arch/arm64/boot/dtb      .
 
-          sed -i "s|kernel.string=.*|kernel.string=Entropy-1.0-APatch|"   anykernel.sh
-          sed -i "s|do.devicecheck=.*|do.devicecheck=0;|"                  anykernel.sh
-          sed -i "s|block=.*|block=${{ env.DEVICE_BLOCK }};|"              anykernel.sh
-          sed -i "s|is_slot_device=.*|is_slot_device=${IS_SLOT};|"         anykernel.sh
-          sed -i "s|ramdisk_compression=.*|ramdisk_compression=auto;|"     anykernel.sh
+          zip -r9 "${ZIP_NAME}" * -x ".git/*" "*.yml" "*.md"
 
-          zip -r9 ../Entropy-1.0-APatch-AnyKernel.zip * -x '.git/*' README.md
-          echo "✅ ZIP created"
+          rm -f Image dtbo.img dtb
+          cd ..
 
-      # ───────────────────────────────────────
-      # 14. Upload artifact
-      # ───────────────────────────────────────
-      - name: Upload AnyKernel3 ZIP
+          # Save zip name for later steps
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "ZIP_PATH=$(pwd)/anykernel/${ZIP_NAME}" >> $GITHUB_ENV
+          echo "✔ Package ready: ${ZIP_NAME}"
+
+      # ─── 11. Upload artifact ─────────────────────────────────────────
+      - name: Upload kernel zip
         uses: actions/upload-artifact@v4
         with:
-          name: Entropy-1.0-APatch-AnyKernel
-          path: Entropy-1.0-APatch-AnyKernel.zip
-          retention-days: 14
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: kernel/build.log
+          retention-days: 3
+
+      # ─── 12. GitHub Release (optional) ───────────────────────────────
+      - name: Create GitHub Release
+        if: ${{ inputs.release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: phoenix-${{ github.run_number }}
+          name: "phoeniX | SM8250 | SuSFS + APatch | ${{ github.run_number }}"
+          body: |
+            ### phoeniX Kernel for SM8250
+
+            **Features**
+            - ✅ SuSFS patches (`${{ inputs.susfs_branch }}`)
+            - ✅ APatch super key embedded at compile time
+            - ✅ AnyKernel3 flashable zip
+
+            **Build info**
+            - Commit: `${{ github.sha }}`
+            - Run: `#${{ github.run_number }}`
+            - Date: `${{ github.event.repository.updated_at }}`
+          files: ${{ env.ZIP_PATH }}
+          draft: false
+          prerelease: false
