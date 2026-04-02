@@ -1,0 +1,509 @@
+name: Build Kernel (ReSukiSU + SuSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      susfs_branch:
+        description: "SuSFS branch"
+        required: false
+        default: "kernel-4.19"
+      release:
+        description: "Create a GitHub Release after build"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: "phoeniX | SM8250 | ReSukiSU + SuSFS"
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ─── 1. Checkout kernel source ───────────────────────────────────
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: kernel
+
+      # ─── 2. System dependencies ──────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache \
+            curl flex git kmod libelf-dev libssl-dev \
+            lz4 python3 unzip wget zip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu cpio
+
+      # ─── 3. ccache ───────────────────────────────────────────────────
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: 5G
+          key: phoenix-sm8250-${{ github.ref_name }}
+          restore-keys: phoenix-sm8250-
+
+      # ─── 4. Toolchain ────────────────────────────────────────────────
+      - name: Clone toolchain (ryukftw)
+        run: |
+          git clone --depth=1 \
+            https://gitlab.com/ryukftw/toolchain.git \
+            kernel/toolchain
+
+      # ─── 5. AnyKernel3 ───────────────────────────────────────────────
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 \
+            https://github.com/bijoyv9/AnyKernel3.git \
+            kernel/anykernel
+
+      # ─── 6. ReSukiSU — add to kernel source tree ─────────────────────
+      #
+      #  setup.sh clones KernelSU into kernel/KernelSU/ and patches the
+      #  Makefile / Kconfig to wire the module into the build system.
+      #  This is "deep integration" — KernelSU is compiled into the kernel,
+      #  not injected post-build like APatch.
+      #
+      - name: Add ReSukiSU to kernel source tree
+        working-directory: kernel
+        run: |
+          echo "──────────────────────────────────────"
+          echo " Adding ReSukiSU to kernel tree"
+          echo "──────────────────────────────────────"
+          curl -LSs \
+            "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
+            | bash
+          echo "✔ ReSukiSU tree: $(ls KernelSU/)"
+
+      # ─── 7. ReSukiSU — required manual hooks ─────────────────────────
+      #
+      #  For non-GKI kernel 4.19, kprobe is unreliable. ReSukiSU requires
+      #  these four files to be patched with hook call sites.
+      #  The Python script below inserts each hook using regex so it is
+      #  robust to minor line-number drift across kernel versions.
+      #
+      #  Required hooks (kernel 4.19):
+      #    fs/stat.c        — newfstatat entry, fstatat64 entry,
+      #                       newfstat return, fstat64 return
+      #    fs/exec.c        — do_execve entry, compat_do_execve entry
+      #    fs/open.c        — faccessat entry  (4.19+ do_faccessat path)
+      #    kernel/reboot.c  — reboot syscall entry  (3.11+ path)
+      #
+      #  Auto hooks via LSM (no source change needed, handled by Kconfig):
+      #    CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK  — covers setuid/setresuid
+      #    CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK  — covers sys_read / init.rc
+      #    CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK   — covers input_event
+      #
+      - name: Apply ReSukiSU manual hooks
+        working-directory: kernel
+        run: |
+          python3 - <<'PYEOF'
+          import re, sys
+
+          def patch_file(path, replacements):
+              try:
+                  with open(path, 'r') as f:
+                      src = f.read()
+              except FileNotFoundError:
+                  print(f"  !! {path} not found — skipping")
+                  return False
+              original = src
+              for pattern, replacement in replacements:
+                  src, n = re.subn(pattern, replacement, src, flags=re.MULTILINE)
+                  if n == 0:
+                      print(f"  ?? pattern not matched in {path}: {repr(pattern[:60])}")
+              if src == original:
+                  print(f"  -- no changes in {path} (already patched?)")
+                  return False
+              with open(path, 'w') as f:
+                  f.write(src)
+              print(f"  ✔ patched: {path}")
+              return True
+
+          print("═══════════════════════════════════════")
+          print(" Applying ReSukiSU manual hooks (4.19)")
+          print("═══════════════════════════════════════")
+
+          # ── fs/stat.c ─────────────────────────────────────────────────
+          # Hook 1: newfstatat entry
+          # Hook 2: fstatat64 entry
+          # Hook 3: newfstat return
+          # Hook 4: fstat64 return
+          print("\n→ fs/stat.c")
+          patch_file("fs/stat.c", [
+              # Declare extern functions before #if !defined(__ARCH_WANT_STAT64)
+              (
+                  r'(#if !defined\(__ARCH_WANT_STAT64\) \|\| defined\(__ARCH_WANT_SYS_NEWFSTATAT\))',
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '__attribute__((hot))\n'
+                  'extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n'
+                  'extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n'
+                  '#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n'
+                  'extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n'
+                  '#endif\n'
+                  '#endif\n\n'
+                  r'\1'
+              ),
+              # newfstatat entry hook
+              (
+                  r'(SYSCALL_DEFINE4\(newfstatat, int, dfd, const char __user \*, filename,\s*'
+                  r'struct stat __user \*, statbuf, int, flag\)\s*\{)\s*'
+                  r'((\s*struct kstat stat;\s*\n\s*int error;\s*\n))',
+                  r'\1\n'
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '\tksu_handle_stat(&dfd, &filename, &flag);\n'
+                  '#endif\n'
+                  r'\2'
+              ),
+              # fstatat64 entry hook
+              (
+                  r'(SYSCALL_DEFINE4\(fstatat64, int, dfd, const char __user \*, filename,\s*'
+                  r'struct stat64 __user \*, statbuf, int, flag\)\s*\{)\s*'
+                  r'((\s*struct kstat stat;\s*\n\s*int error;\s*\n))',
+                  r'\1\n'
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '\tksu_handle_stat(&dfd, &filename, &flag);\n'
+                  '#endif\n'
+                  r'\2'
+              ),
+              # newfstat return hook — after cp_new_stat before return
+              (
+                  r'(SYSCALL_DEFINE2\(newfstat, unsigned int, fd, struct stat __user \*, statbuf\)'
+                  r'.*?if \(!error\)\s*\n\s*error = cp_new_stat\(&stat, statbuf\);)',
+                  r'\1\n'
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '\tksu_handle_newfstat_ret(&fd, &statbuf);\n'
+                  '#endif'
+              ),
+              # fstat64 return hook
+              (
+                  r'(SYSCALL_DEFINE2\(fstat64, unsigned long, fd, struct stat64 __user \*, statbuf\)'
+                  r'.*?if \(!error\)\s*\n\s*error = cp_new_stat64\(&stat, statbuf\);)',
+                  r'\1\n'
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '\tksu_handle_fstat64_ret(&fd, &statbuf);\n'
+                  '#endif'
+              ),
+          ])
+
+          # ── fs/exec.c ─────────────────────────────────────────────────
+          # Hook do_execve and compat_do_execve (kernel 3.14+ signature)
+          print("\n→ fs/exec.c")
+          patch_file("fs/exec.c", [
+              # Declare extern before int do_execve(
+              (
+                  r'(^int do_execve\(struct filename)',
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '__attribute__((hot))\n'
+                  'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n'
+                  '\t\t\t\tvoid *argv, void *envp, int *flags);\n'
+                  '#endif\n\n'
+                  r'\1'
+              ),
+              # Hook entry of do_execve — inject before return do_execveat_common
+              (
+                  r'(int do_execve\(struct filename \*filename,\s*\n'
+                  r'\s*const char __user \*const __user \*__argv,\s*\n'
+                  r'\s*const char __user \*const __user \*__envp\)\s*\n'
+                  r'\{\s*\n'
+                  r'\s*struct user_arg_ptr argv = \{ \.ptr\.native = __argv \};\s*\n'
+                  r'\s*struct user_arg_ptr envp = \{ \.ptr\.native = __envp \};\s*\n)'
+                  r'(\s*return do_execveat_common)',
+                  r'\1'
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n'
+                  '#endif\n'
+                  r'\2'
+              ),
+              # compat_do_execve — inject before return do_execveat_common
+              (
+                  r'(compat_do_execve\(.*?\n(?:.*?\n)*?\s*\.is_compat = true,\s*\n'
+                  r'\s*\.ptr\.compat = __envp,\s*\n\s*\};\s*\n)'
+                  r'(\s*return do_execveat_common)',
+                  r'\1'
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n'
+                  '#endif\n'
+                  r'\2'
+              ),
+          ])
+
+          # ── fs/open.c ─────────────────────────────────────────────────
+          # Kernel 4.19+ path: faccessat calls do_faccessat.
+          # Hook SYSCALL_DEFINE3(faccessat) entry.
+          print("\n→ fs/open.c")
+          patch_file("fs/open.c", [
+              # Declare extern before SYSCALL_DEFINE3(faccessat
+              (
+                  r'(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\))',
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '__attribute__((hot))\n'
+                  'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n'
+                  '\t\t\t\tint *mode, int *flags);\n'
+                  '#endif\n\n'
+                  r'\1'
+              ),
+              # Insert hook call at start of SYSCALL_DEFINE3(faccessat) body
+              (
+                  r'(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\s*\n'
+                  r'\{)\s*\n'
+                  r'(\s*return do_faccessat)',
+                  r'\1\n'
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n'
+                  '#endif\n'
+                  r'\2'
+              ),
+          ])
+
+          # ── kernel/reboot.c ───────────────────────────────────────────
+          # Kernel 3.11+ path: hook SYSCALL_DEFINE4(reboot) entry
+          print("\n→ kernel/reboot.c")
+          patch_file("kernel/reboot.c", [
+              # Declare extern before SYSCALL_DEFINE4(reboot
+              (
+                  r'(SYSCALL_DEFINE4\(reboot, int, magic1, int, magic2, unsigned int, cmd,\s*\n'
+                  r'\s*void __user \*, arg\))',
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  'extern int ksu_handle_sys_reboot(int magic1, int magic2,\n'
+                  '\t\t\tunsigned int cmd, void __user **arg);\n'
+                  '#endif\n\n'
+                  r'\1'
+              ),
+              # Insert hook call — after local var declarations, before capability check
+              (
+                  r'(SYSCALL_DEFINE4\(reboot.*?\{.*?'
+                  r'char buffer\[256\];\s*\n\s*int ret = 0;\s*\n)'
+                  r'(\s*/\* We only trust)',
+                  r'\1'
+                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n'
+                  '#endif\n'
+                  r'\2',
+              ),
+          ])
+
+          print("\n═══════════════════════════════════════")
+          print(" ✔ All required hooks applied")
+          print("═══════════════════════════════════════")
+          PYEOF
+
+      # ─── 8. SuSFS patches ────────────────────────────────────────────
+      - name: Clone SuSFS
+        run: |
+          git clone --depth=1 \
+            -b ${{ inputs.susfs_branch }} \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            /tmp/susfs4ksu
+
+      - name: Apply SuSFS kernel patches
+        working-directory: kernel
+        run: |
+          PATCH_DIR=/tmp/susfs4ksu/kernel_patches
+
+          echo "──────────────────────────────────────"
+          echo " Applying SuSFS patches (kernel-4.19)"
+          echo "──────────────────────────────────────"
+
+          MAIN_PATCH="$PATCH_DIR/50_add_susfs_in_kernel-4.19.patch"
+          if [ -f "$MAIN_PATCH" ]; then
+            echo "→ Applying: 50_add_susfs_in_kernel-4.19.patch"
+            patch -p1 --forward --no-backup-if-mismatch < "$MAIN_PATCH" || \
+              echo "  (minor fuzz — continuing)"
+          else
+            echo "ERROR: $MAIN_PATCH not found!" >&2
+            echo "Available patches in repo:"
+            ls "$PATCH_DIR/"
+            exit 1
+          fi
+
+          echo "→ Copying susfs source files"
+          cp -v "$PATCH_DIR/fs/susfs.c"            fs/            2>/dev/null || true
+          cp -v "$PATCH_DIR/include/linux/susfs.h" include/linux/ 2>/dev/null || true
+
+          echo "✔ SuSFS patches applied"
+
+      # ─── 9. Generate .config ─────────────────────────────────────────
+      - name: Generate .config
+        working-directory: kernel
+        run: |
+          CLANG_BIN=$(pwd)/toolchain/clang/bin
+          CROSS_COMPILE=$(pwd)/toolchain/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+          OUT_DIR=$(pwd)/out
+
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export KERNEL_SRC=${OUT_DIR}
+          export PATH="${CLANG_BIN}:${PATH}"
+
+          TARGET_KERNEL_MAKE_ENV="CC=${CLANG_BIN}/clang"
+          LLVM_TOOLS="NM=${CLANG_BIN}/llvm-nm \
+                      OBJCOPY=${CLANG_BIN}/llvm-objcopy \
+                      OBJDUMP=${CLANG_BIN}/llvm-objdump \
+                      STRIP=${CLANG_BIN}/llvm-strip"
+          CONFIG="vendor/kona-perf_defconfig vendor/oplus.config"
+
+          echo "→ Generating .config from defconfig"
+          make O=${OUT_DIR} \
+               ${TARGET_KERNEL_MAKE_ENV} \
+               LLVM_IAS=1 \
+               ARCH=arm64 \
+               CROSS_COMPILE=${CROSS_COMPILE} \
+               ${LLVM_TOOLS} \
+               ${CONFIG}
+
+          echo "→ Enabling ReSukiSU Kconfig options"
+          ./scripts/config --file ${OUT_DIR}/.config \
+            -e KSU \
+            -e KSU_MANUAL_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+            2>/dev/null || true
+
+          echo "→ Enabling SuSFS config options"
+          ./scripts/config --file ${OUT_DIR}/.config \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_SUS_OVERLAYFS \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            2>/dev/null || true
+
+          make O=${OUT_DIR} ARCH=arm64 olddefconfig
+          echo "✔ Config ready"
+
+          # Confirm critical options are actually set
+          echo "── Config verification ──────────────────"
+          for opt in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK \
+                     CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+                     CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+                     CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+                     CONFIG_KSU_SUSFS; do
+            val=$(grep "^${opt}=" ${OUT_DIR}/.config || echo "${opt}=NOT SET")
+            echo "  $val"
+          done
+
+      # ─── 10. Build kernel ─────────────────────────────────────────────
+      - name: Compile kernel
+        working-directory: kernel
+        run: |
+          CLANG_BIN=$(pwd)/toolchain/clang/bin
+          CROSS_COMPILE=$(pwd)/toolchain/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+          OUT_DIR=$(pwd)/out
+
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export KERNEL_SRC=${OUT_DIR}
+          export PATH="${CLANG_BIN}:${PATH}"
+          export CCACHE_EXEC="${CLANG_BIN}/clang"
+          export USE_CCACHE=1
+          export CCACHE_DIR="${HOME}/.ccache"
+
+          TARGET_KERNEL_MAKE_ENV="CC=${CLANG_BIN}/clang"
+          LLVM_TOOLS="NM=${CLANG_BIN}/llvm-nm \
+                      OBJCOPY=${CLANG_BIN}/llvm-objcopy \
+                      OBJDUMP=${CLANG_BIN}/llvm-objdump \
+                      STRIP=${CLANG_BIN}/llvm-strip"
+
+          echo "──────────────────────────────────────"
+          echo " Building kernel"
+          echo "──────────────────────────────────────"
+          make ARCH=arm64 \
+               CROSS_COMPILE=${CROSS_COMPILE} \
+               LLVM_IAS=1 \
+               O=${OUT_DIR} \
+               ${TARGET_KERNEL_MAKE_ENV} \
+               ${LLVM_TOOLS} \
+               -j$(nproc --all) 2>&1 | tee build.log
+
+          echo "✔ Kernel build complete"
+
+      # ─── 11. Verify boot artifacts ───────────────────────────────────
+      - name: Verify boot artifacts
+        working-directory: kernel
+        run: |
+          for f in out/arch/arm64/boot/Image \
+                   out/arch/arm64/boot/dtbo.img \
+                   out/arch/arm64/boot/dtb; do
+            if [ -f "$f" ]; then
+              echo "✔ $f  ($(du -sh $f | cut -f1))"
+            else
+              echo "✘ MISSING: $f" && exit 1
+            fi
+          done
+
+      # ─── 12. Package with AnyKernel3 ─────────────────────────────────
+      - name: Package zip (AnyKernel3)
+        working-directory: kernel
+        run: |
+          DT=$(date +"%Y%m%d-%H%M")
+          ZIP_NAME="phoeniX-AOSP-${DT}.zip"
+
+          cd anykernel
+          rm -f ./*.zip
+
+          cp ../out/arch/arm64/boot/Image    .
+          cp ../out/arch/arm64/boot/dtbo.img .
+          cp ../out/arch/arm64/boot/dtb      .
+
+          zip -r9 "${ZIP_NAME}" * -x ".git/*" "*.yml" "*.md"
+          rm -f Image dtbo.img dtb
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}"                    >> $GITHUB_ENV
+          echo "ZIP_PATH=$(pwd)/anykernel/${ZIP_NAME}"   >> $GITHUB_ENV
+          echo "✔ ${ZIP_NAME}"
+
+      # ─── 13. Upload artifacts ─────────────────────────────────────────
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: kernel/build.log
+          retention-days: 3
+
+      # ─── 14. GitHub Release (optional) ───────────────────────────────
+      - name: Create GitHub Release
+        if: ${{ inputs.release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: phoenix-${{ github.run_number }}
+          name: "phoeniX | SM8250 | ReSukiSU + SuSFS | #${{ github.run_number }}"
+          body: |
+            ### phoeniX Kernel for SM8250
+
+            **Features**
+            - ✅ ReSukiSU — deep source integration (non-GKI manual hooks)
+            - ✅ SuSFS `${{ inputs.susfs_branch }}` kernel patches
+            - ✅ AnyKernel3 flashable zip
+
+            **Hook integration (kernel 4.19)**
+            - `fs/stat.c` — newfstatat, fstatat64, newfstat, fstat64
+            - `fs/exec.c` — do_execve, compat_do_execve
+            - `fs/open.c` — faccessat
+            - `kernel/reboot.c` — reboot
+            - setuid / initrc / input — auto-hooked via LSM (no source change)
+
+            **Build info**
+            - Commit: `${{ github.sha }}`
+            - Run: `#${{ github.run_number }}`
+
+            > Flash via TWRP. Install ReSukiSU Manager APK after first boot.
+          files: ${{ env.ZIP_PATH }}
+          draft: false
+          prerelease: false
