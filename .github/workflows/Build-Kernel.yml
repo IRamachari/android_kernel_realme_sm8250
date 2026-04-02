@@ -147,9 +147,19 @@ jobs:
 
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export KERNEL_SRC=${OUT_DIR}
-          export PATH="${CLANG_BIN}:${MAKE_PATH}:${PATH}"
+          # Only prepend clang bin — do NOT add build-tools/bin to PATH.
+          # Android's build-tools bison requires internal m4 files that
+          # don't exist on GitHub runners, breaking kconfig generation.
+          export PATH="${CLANG_BIN}:${PATH}"
 
-          TARGET_KERNEL_MAKE_ENV="CC=ccache ${CLANG_BIN}/clang"
+          # ccache via CCACHE_EXEC instead of wrapping CC directly.
+          # Wrapping as "CC=ccache /path/clang" causes make to split it
+          # into two tokens, passing "-r" and other flags to ccache itself.
+          export CCACHE_EXEC="${CLANG_BIN}/clang"
+          export USE_CCACHE=1
+          export CCACHE_DIR="${HOME}/.ccache"
+
+          TARGET_KERNEL_MAKE_ENV="CC=${CLANG_BIN}/clang"
           LLVM_TOOLS="NM=${CLANG_BIN}/llvm-nm \
                       OBJCOPY=${CLANG_BIN}/llvm-objcopy \
                       OBJDUMP=${CLANG_BIN}/llvm-objdump \
