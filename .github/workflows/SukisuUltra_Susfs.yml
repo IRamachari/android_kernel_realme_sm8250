@@ -75,29 +75,57 @@ jobs:
           echo "✔ KernelSU tree: $(ls KernelSU/)"
 
 
-      # ─── 6b. Suppress Clang 20 strict warnings in KernelSU driver ────
+      # ─── 6b. Fix kernel 4.19 + Clang 20 compatibility ───────────────
       #
-      #  Clang 20 rejects K&R implicit-int and no-prototype declarations
-      #  as errors (-Werror,-Wimplicit-int / -Wimplicit-function-declaration).
-      #  SukiSU Ultra's core/init.c has one such pattern. We patch only the
-      #  kernelsu driver's Makefile to relax those two warnings, leaving the
-      #  rest of the kernel build strict.
+      #  MODULE_IMPORT_NS() was introduced in Linux 5.4. SukiSU Ultra's
+      #  core/init.c line 221 calls it unconditionally. On 4.19 it is
+      #  undefined, so Clang 20 (strict -Werror,-Wimplicit-int) treats it
+      #  as an undeclared function and fails.
       #
-      - name: Fix KernelSU driver Clang 20 compatibility
+      #  Fix: prepend a no-op compat define to init.c so the macro
+      #  compiles away cleanly. Also add broad Clang 20 tolerance flags
+      #  to the kernelsu Makefile for any other K&R-style patterns.
+      #
+      - name: Fix KernelSU driver kernel 4.19 + Clang 20 compatibility
         working-directory: kernel
         run: |
-          MAKEFILE="drivers/kernelsu/Makefile"
-          if [ -f "$MAKEFILE" ]; then
-            # Append warning suppression flags only if not already present
-            if ! grep -q "Wno-implicit-int" "$MAKEFILE"; then
-              echo '' >> "$MAKEFILE"
-              echo 'ccflags-y += -Wno-implicit-int -Wno-implicit-function-declaration -Wno-int-conversion' >> "$MAKEFILE"
-              echo "✔ Patched $MAKEFILE for Clang 20 compatibility"
-            else
-              echo "-- Already patched"
-            fi
+          # ── 1. MODULE_IMPORT_NS compat shim ──────────────────────────
+          INIT_C="drivers/kernelsu/core/init.c"
+          if [ -f "$INIT_C" ] && grep -q "MODULE_IMPORT_NS" "$INIT_C"; then
+            # Wrap MODULE_IMPORT_NS with LINUX_VERSION_CODE guard.
+            # This is the standard fix used across kernel drivers (Intel IPU6,
+            # gasket-driver, etc.): MODULE_IMPORT_NS was introduced in Linux 5.4,
+            # so guard it with KERNEL_VERSION(5, 4, 0).
+            python3 - <<'PYEOF'
+          import re
+          path = "drivers/kernelsu/core/init.c"
+          with open(path, "r") as f:
+              src = f.read()
+          if "LINUX_VERSION_CODE" not in src:
+              # Add linux/version.h include if not already present
+              if "#include <linux/version.h>" not in src:
+                  src = "#include <linux/version.h>\n" + src
+              # Wrap each MODULE_IMPORT_NS call with version guard
+              src = re.sub(
+                  r'(MODULE_IMPORT_NS\([^)]+\);)',
+                  r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)\n\1\n#endif',
+                  src
+              )
+              with open(path, "w") as f:
+                  f.write(src)
+              print("  ✔ Wrapped MODULE_IMPORT_NS with LINUX_VERSION_CODE guard")
+          else:
+              print("  -- Already patched:", path)
+          PYEOF
           else
-            echo "!! $MAKEFILE not found"
+            echo "  -- $INIT_C not found or no MODULE_IMPORT_NS usage"
+          fi
+
+          # ── 2. Broad Clang 20 warning tolerance for kernelsu driver ──
+          MAKEFILE="drivers/kernelsu/Makefile"
+          if [ -f "$MAKEFILE" ] && ! grep -q "Wno-implicit-int" "$MAKEFILE"; then
+            printf '\nccflags-y += -Wno-implicit-int -Wno-implicit-function-declaration -Wno-int-conversion\n'               >> "$MAKEFILE"
+            echo "  ✔ Added Clang 20 tolerance flags to $MAKEFILE"
           fi
 
       # ─── 7. Manual hooks for non-GKI kernel 4.19 ─────────────────────
