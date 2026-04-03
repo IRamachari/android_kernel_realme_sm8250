@@ -446,11 +446,9 @@ jobs:
             -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
             -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
             -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
-            -e KPM \
             2>/dev/null || true
 
-          # KALLSYMS_ALL=y required for KPM on non-GKI
-          echo "→ Enabling KALLSYMS_ALL (required for KPM)"
+          echo "→ Enabling KALLSYMS + KALLSYMS_ALL"
           ./scripts/config --file ${OUT_DIR}/.config \
             -e KALLSYMS \
             -e KALLSYMS_ALL \
@@ -460,7 +458,7 @@ jobs:
           echo "✔ Config ready"
 
           echo "── Config verification ──────────────────"
-          for opt in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KPM \
+          for opt in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK \
                      CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL \
                      CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
                      CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
@@ -584,7 +582,7 @@ jobs:
 
             **Features**
             - ✅ SukiSU Ultra (`susfs-main`) — SUSFS v2 built-in, no separate patches
-            - ✅ KPM (Kernel Patch Module) support
+            - ⚠️ KPM disabled (non-GKI 4.19 — uapi header path unsupported)
             - ✅ GPU OC — 670 MHz max (KonaBess extreme undervolt table)
             - ✅ AnyKernel3 flashable zip
 
