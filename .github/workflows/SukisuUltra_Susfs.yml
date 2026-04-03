@@ -74,6 +74,32 @@ jobs:
             | bash -s susfs-main
           echo "✔ KernelSU tree: $(ls KernelSU/)"
 
+
+      # ─── 6b. Suppress Clang 20 strict warnings in KernelSU driver ────
+      #
+      #  Clang 20 rejects K&R implicit-int and no-prototype declarations
+      #  as errors (-Werror,-Wimplicit-int / -Wimplicit-function-declaration).
+      #  SukiSU Ultra's core/init.c has one such pattern. We patch only the
+      #  kernelsu driver's Makefile to relax those two warnings, leaving the
+      #  rest of the kernel build strict.
+      #
+      - name: Fix KernelSU driver Clang 20 compatibility
+        working-directory: kernel
+        run: |
+          MAKEFILE="drivers/kernelsu/Makefile"
+          if [ -f "$MAKEFILE" ]; then
+            # Append warning suppression flags only if not already present
+            if ! grep -q "Wno-implicit-int" "$MAKEFILE"; then
+              echo '' >> "$MAKEFILE"
+              echo 'ccflags-y += -Wno-implicit-int -Wno-implicit-function-declaration -Wno-int-conversion' >> "$MAKEFILE"
+              echo "✔ Patched $MAKEFILE for Clang 20 compatibility"
+            else
+              echo "-- Already patched"
+            fi
+          else
+            echo "!! $MAKEFILE not found"
+          fi
+
       # ─── 7. Manual hooks for non-GKI kernel 4.19 ─────────────────────
       #
       #  kprobe is unreliable on non-GKI 4.19. Four files need call-site
@@ -126,7 +152,7 @@ jobs:
           patch_file("fs/stat.c", [
               (
                   r'(#if !defined\(__ARCH_WANT_STAT64\) \|\| defined\(__ARCH_WANT_SYS_NEWFSTATAT\))',
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '__attribute__((hot))\n'
                   'extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n'
                   'extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n'
@@ -141,7 +167,7 @@ jobs:
                   r'struct stat __user \*, statbuf, int, flag\)\s*\{)\s*'
                   r'((\s*struct kstat stat;\s*\n\s*int error;\s*\n))',
                   r'\1\n'
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '\tksu_handle_stat(&dfd, &filename, &flag);\n'
                   '#endif\n'
                   r'\2'
@@ -151,7 +177,7 @@ jobs:
                   r'struct stat64 __user \*, statbuf, int, flag\)\s*\{)\s*'
                   r'((\s*struct kstat stat;\s*\n\s*int error;\s*\n))',
                   r'\1\n'
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '\tksu_handle_stat(&dfd, &filename, &flag);\n'
                   '#endif\n'
                   r'\2'
@@ -160,7 +186,7 @@ jobs:
                   r'(SYSCALL_DEFINE2\(newfstat, unsigned int, fd, struct stat __user \*, statbuf\)'
                   r'.*?if \(!error\)\s*\n\s*error = cp_new_stat\(&stat, statbuf\);)',
                   r'\1\n'
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '\tksu_handle_newfstat_ret(&fd, &statbuf);\n'
                   '#endif'
               ),
@@ -168,7 +194,7 @@ jobs:
                   r'(SYSCALL_DEFINE2\(fstat64, unsigned long, fd, struct stat64 __user \*, statbuf\)'
                   r'.*?if \(!error\)\s*\n\s*error = cp_new_stat64\(&stat, statbuf\);)',
                   r'\1\n'
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '\tksu_handle_fstat64_ret(&fd, &statbuf);\n'
                   '#endif'
               ),
@@ -179,7 +205,7 @@ jobs:
           patch_file("fs/exec.c", [
               (
                   r'(^int do_execve\(struct filename)',
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '__attribute__((hot))\n'
                   'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n'
                   '\t\t\t\tvoid *argv, void *envp, int *flags);\n'
@@ -195,7 +221,7 @@ jobs:
                   r'\s*struct user_arg_ptr envp = \{ \.ptr\.native = __envp \};\s*\n)'
                   r'(\s*return do_execveat_common)',
                   r'\1'
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n'
                   '#endif\n'
                   r'\2'
@@ -205,7 +231,7 @@ jobs:
                   r'\s*\.ptr\.compat = __envp,\s*\n\s*\};\s*\n)'
                   r'(\s*return do_execveat_common)',
                   r'\1'
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n'
                   '#endif\n'
                   r'\2'
@@ -217,7 +243,7 @@ jobs:
           patch_file("fs/open.c", [
               (
                   r'(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\))',
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '__attribute__((hot))\n'
                   'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n'
                   '\t\t\t\tint *mode, int *flags);\n'
@@ -229,7 +255,7 @@ jobs:
                   r'\{)\s*\n'
                   r'(\s*return do_faccessat)',
                   r'\1\n'
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n'
                   '#endif\n'
                   r'\2'
@@ -242,7 +268,7 @@ jobs:
               (
                   r'(SYSCALL_DEFINE4\(reboot, int, magic1, int, magic2, unsigned int, cmd,\s*\n'
                   r'\s*void __user \*, arg\))',
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   'extern int ksu_handle_sys_reboot(int magic1, int magic2,\n'
                   '\t\t\tunsigned int cmd, void __user **arg);\n'
                   '#endif\n\n'
@@ -253,7 +279,7 @@ jobs:
                   r'char buffer\[256\];\s*\n\s*int ret = 0;\s*\n)'
                   r'(\s*/\* We only trust)',
                   r'\1'
-                  '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+                  '#ifdef CONFIG_KSU\n'
                   '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n'
                   '#endif\n'
                   r'\2',
